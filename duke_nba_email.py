@@ -46,92 +46,38 @@ DUKE_SUBSTRING = "duke"  # case-insensitive match on college field
 DUKE_CACHE_MAX_AGE_DAYS = 30  # how long to trust the cached Duke player list
 
 
-# ---------- DUKE PLAYER DISCOVERY (WITH CACHE) ----------
-
-def load_duke_cache() -> List[int]:
-    """Load cached Duke player IDs if cache exists and is not too old."""
-    if not CACHE_FILE.exists():
-        return []
-
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
-
-    ts_str = data.get("timestamp")
-    player_ids = data.get("player_ids", [])
-    if not ts_str or not isinstance(player_ids, list):
-        return []
-
-    try:
-        ts = datetime.fromisoformat(ts_str)
-    except ValueError:
-        return []
-
-    age_days = (datetime.utcnow() - ts).days
-    if age_days > DUKE_CACHE_MAX_AGE_DAYS:
-        return []
-
-    return [int(pid) for pid in player_ids]
-
-
-def save_duke_cache(player_ids: List[int]) -> None:
-    """Save Duke player IDs to cache with timestamp."""
-    payload = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "player_ids": list(map(int, player_ids)),
-    }
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
-
-def fetch_duke_player_ids_from_api(sleep_between_calls: float = 0.6) -> List[int]:
-    """
-    Query nba_api for all active players and filter by college containing 'Duke'.
-
-    This makes one API call per player (commonplayerinfo), so we:
-    - rate-limit via a small sleep
-    - cache the result to avoid doing this often
-    """
-    print("Refreshing Duke player list from NBA API...")
-    active_players = players.get_active_players()
-    duke_ids: List[int] = []
-
-    for i, p in enumerate(active_players, start=1):
-        pid = p["id"]
-        name = f'{p.get("full_name") or (p.get("first_name", "") + " " + p.get("last_name", ""))}'.strip()
-        try:
-            info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=30)
-            df = info.get_data_frames()[0]
-            college = str(df.loc[0, "SCHOOL"] or "").lower()
-            if DUKE_SUBSTRING in college:
-                duke_ids.append(pid)
-                print(f"  ✓ {name} ({pid}) — college: {college}")
-        except Exception as e:
-            print(f"  ! Error fetching college for {name} ({pid}): {e}")
-
-        # be kind to the API
-        time.sleep(sleep_between_calls)
-
-    print(f"Found {len(duke_ids)} active Duke NBA players.")
-    return duke_ids
-
-
-def get_duke_player_ids() -> List[int]:
-    """
-    Get list of active Duke player IDs, using cache if valid, else refreshing.
-    """
-    cached = load_duke_cache()
-    if cached:
-        print(f"Using cached Duke player list ({len(cached)} players).")
-        return cached
-
-    duke_ids = fetch_duke_player_ids_from_api()
-    if duke_ids:
-        save_duke_cache(duke_ids)
-    return duke_ids
-
+# ---------- HARDCODED DUKE NBA PLAYERS ----------
+# Player IDs from NBA.com (stable)
+DUKE_PLAYER_IDS = {
+    # Superstars / starters
+    1627751, # Grayson Allen
+    1628976, # Marvin Bagley III
+    1630162, # Paolo Banchero
+    1629651, # RJ Barrett
+    1628970, # Wendell Carter Jr.
+    203552,  # Seth Curry
+    1631132, # Kyle Filipowski
+    1642843, # Cooper Flagg
+    1627742, # Brandon Ingram
+    202681,  # Kyrie Irving
+    1642883, # Sion James
+    1630552, # Jalen Johnson
+    1629014, # Tre Jones
+    1628969, # Tyus Jones
+    1628384, # Luke Kennard
+    1642851, # Kon Knueppel
+    1631108, # Dereck Lively II
+    1642863, # Khalman Maluach
+    1631135, # Jared McCain
+    1631111, # Wendell Moore Jr
+    203486, # Mason Plumlee
+    1642878, # Tyrese Proctor
+    1628369, # Jayson Tatum
+    1627783, # Gary Trent Jr.
+    1630228, # Mark Williams
+    1629660, # Zion Williamson
+    1631109, # Dariq Whitehead
+}
 
 # ---------- GAME + BOX SCORE FETCHING ----------
 
