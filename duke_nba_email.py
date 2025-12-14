@@ -20,7 +20,8 @@ Email config via environment variables (recommended):
 
 If EMAIL_TO is not set, the script will just print the email body.
 """
-
+import random
+import requests
 import os
 import time
 from datetime import datetime, timedelta, date
@@ -70,17 +71,34 @@ duke_player_ids = {
     1631109, # Dariq Whitehead
 }
 
+def with_retries(fn, *, retries=5, base_sleep=2, label="request"):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                TimeoutError) as e:
+            last_err = e
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.7)
+            print(f"  ! {label} failed (attempt {attempt}/{retries}): {repr(e)}")
+            if attempt < retries:
+                print(f"    retrying in {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+    raise last_err
+    
 # ---------- GAME + BOX SCORE FETCHING ----------
 
 def get_scoreboard_for_date(target_date: date) -> pd.DataFrame:
-    """
-    Get ScoreboardV2 game header DataFrame for a given date.
-    """
     date_str = target_date.strftime("%m/%d/%Y")
     print(f"Fetching NBA scoreboard for {date_str}...")
-    sb = scoreboardv2.ScoreboardV2(game_date=date_str, timeout=60)
-    games_df = sb.game_header.get_data_frame()
-    return games_df
+
+    def _call():
+        sb = scoreboardv2.ScoreboardV2(game_date=date_str, timeout=120)
+        return sb.game_header.get_data_frame()
+
+    return with_retries(_call, retries=5, base_sleep=2, label="scoreboardv2")
 
 
 def get_duke_stats_for_date(target_date: date, duke_player_ids: List[int]) -> pd.DataFrame:
