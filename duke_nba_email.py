@@ -48,7 +48,7 @@ DUKE_CACHE_MAX_AGE_DAYS = 30  # how long to trust the cached Duke player list
 
 # ---------- HARDCODED DUKE NBA PLAYERS ----------
 # Player IDs from NBA.com (stable)
-DUKE_PLAYER_IDS = {
+duke_player_ids = {
     # Superstars / starters
     1627751, # Grayson Allen
     1628976, # Marvin Bagley III
