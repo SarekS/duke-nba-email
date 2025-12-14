@@ -22,14 +22,11 @@ If EMAIL_TO is not set, the script will just print the email body.
 """
 
 import os
-import json
 import time
 from datetime import datetime, timedelta, date
-from pathlib import Path
 from typing import List, Dict
 
 import pandas as pd
-from nba_api.stats.static import players
 from nba_api.stats.endpoints import (
     commonplayerinfo,
     scoreboardv2,
@@ -38,12 +35,6 @@ from nba_api.stats.endpoints import (
 import smtplib
 from email.mime.text import MIMEText
 
-
-# ---------- CONFIG ----------
-
-CACHE_FILE = Path(__file__).with_name("duke_players_cache.json")
-DUKE_SUBSTRING = "duke"  # case-insensitive match on college field
-DUKE_CACHE_MAX_AGE_DAYS = 30  # how long to trust the cached Duke player list
 
 
 # ---------- HARDCODED DUKE NBA PLAYERS ----------
@@ -244,19 +235,14 @@ def send_email(subject: str, body: str) -> None:
 # ---------- MAIN ENTRYPOINT ----------
 
 def main():
-    # Use yesterday's games (common for a morning email)
     target_date = date.today() - timedelta(days=1)
 
-    duke_ids = get_duke_player_ids()
-    if not duke_ids:
-        print("No Duke player IDs found; aborting.")
-        return
+    duke_ids = list(duke_player_ids)
 
     stats_df = get_duke_stats_for_date(target_date, duke_ids)
     body = format_email_body(stats_df, target_date)
     subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')}"
     send_email(subject, body)
-
 
 if __name__ == "__main__":
     main()
