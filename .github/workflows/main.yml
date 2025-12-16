@@ -2,17 +2,24 @@ name: Duke NBA Daily Email
 
 on:
   schedule:
-    # 6:00 AM America/New_York = 13:00 UTC during Standard Time
-    - cron: "0 13 * * *"
+    # 8:00 AM America/New_York = 13:00 UTC during Standard Time
+    - cron: "0 11 * * *"
   workflow_dispatch:
 
 jobs:
   send-email:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+
+      - name: Show runner IP (diagnostic)
+        run: |
+          echo "Public IP:"
+          curl -s https://api.ipify.org
+          echo ""
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -21,9 +28,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install nba_api pandas
+          python -m pip install --upgrade pip setuptools wheel
+          pip install "nba_api>=1.4.1" pandas requests
 
-      - name: Run script
+      - name: Run script (retry once on failure)
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -32,4 +40,5 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          python duke_nba_email.py
+          set -e
+          python duke_nba_email.py || (echo "First run failed; retrying in 20s..." && sleep 20 && python duke_nba_email.py)
