@@ -82,10 +82,10 @@ def get_with_retries(url: str, *, timeout: int = 25, retries: int = 5) -> reques
 
 def get_game_ids_for_date(d: date) -> List[str]:
     ymd = d.strftime("%Y%m%d")
-    url = f"https://data.nba.net/data/10s/prod/v1/{ymd}/scoreboard.json"
+    url = f"https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_{ymd}.json"
     print(f"Fetching scoreboard: {url}")
     data = get_with_retries(url).json()
-    games = data.get("games", [])
+    games = data.get("scoreboard", {}).get("games", [])
     return [g.get("gameId") for g in games if g.get("gameId")]
 
 
