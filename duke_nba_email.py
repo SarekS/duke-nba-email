@@ -58,16 +58,22 @@ def get_with_retries(url: str, *, timeout: int = 25, retries: int = 5) -> reques
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
-                url,
-                timeout=timeout,
-                headers={
-                    # A normal UA helps some CDNs behave more consistently
-                    "User-Agent": "Mozilla/5.0 (compatible; duke-nba-email/1.0)",
-                    "Accept": "application/json,text/plain,*/*",
-                },
-            )
-            r.raise_for_status()
+         r = requests.get(
+    url,
+    timeout=timeout,
+    headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nba.com/",
+        "Origin": "https://www.nba.com",
+        "Connection": "keep-alive",
+    },
+)
             return r
         except Exception as e:
             last_err = e
