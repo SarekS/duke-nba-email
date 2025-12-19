@@ -2,13 +2,15 @@
 """
 Daily email of Duke NBA player stats (with opponent) for yesterday's games.
 
-Data source: NBA CDN JSON
-- Scoreboard (game list): https://data.nba.net/data/10s/prod/v1/YYYYMMDD/scoreboard.json
+Data sources (NBA JSON feeds):
+- Scoreboard (game list): https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_YYYYMMDD.json
 - Boxscore per game:      https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gameId}.json
 
 Email via SMTP using env vars:
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
-If EMAIL_TO is missing, prints email instead of sending.
+
+If EMAIL_TO or required SMTP settings are missing, prints the email instead of sending.
+If NBA data fetch fails, attempts to send a "Data unavailable" email; if SMTP fails, prints.
 """
 
 import os
@@ -21,6 +23,7 @@ import requests
 
 
 # ---------------- HARDCODED DUKE PLAYER IDS (NBA.com personId) ----------------
+# NOTE: Some newer/rookie IDs below may need verification.
 DUKE_PLAYER_IDS = {
     1627751,  # Grayson Allen
     1628976,  # Marvin Bagley III
@@ -54,26 +57,30 @@ DUKE_PLAYER_IDS = {
 
 # ---------------- HTTP HELPERS ----------------
 
-def get_with_retries(url: str, *, timeout: int = 25, retries: int = 5) -> requests.Response:
+def get_with_retries(url: str, *, timeout: int = 30, retries: int = 5) -> requests.Response:
+    """
+    GET with retries + browser-like headers to reduce 403s from NBA CDN.
+    """
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-         r = requests.get(
-    url,
-    timeout=timeout,
-    headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nba.com/",
-        "Origin": "https://www.nba.com",
-        "Connection": "keep-alive",
-    },
-)
+            r = requests.get(
+                url,
+                timeout=timeout,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json,text/plain,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.nba.com/",
+                    "Origin": "https://www.nba.com",
+                    "Connection": "keep-alive",
+                },
+            )
+            r.raise_for_status()
             return r
         except Exception as e:
             last_err = e
@@ -86,7 +93,12 @@ def get_with_retries(url: str, *, timeout: int = 25, retries: int = 5) -> reques
     raise last_err  # type: ignore
 
 
+# ---------------- NBA DATA ----------------
+
 def get_game_ids_for_date(d: date) -> List[str]:
+    """
+    Fetch game IDs for a given date using NBA's liveData scoreboard JSON.
+    """
     ymd = d.strftime("%Y%m%d")
     url = f"https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_{ymd}.json"
     print(f"Fetching scoreboard: {url}")
@@ -96,11 +108,12 @@ def get_game_ids_for_date(d: date) -> List[str]:
 
 
 def get_boxscore_json(game_id: str) -> Dict[str, Any]:
+    """
+    Fetch full boxscore JSON for a game.
+    """
     url = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
     return get_with_retries(url).json()
 
-
-# ---------------- DATA EXTRACTION ----------------
 
 def _safe_int(x: Any, default: int = 0) -> int:
     try:
@@ -110,6 +123,10 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 
 def collect_duke_lines_for_date(d: date) -> List[Dict[str, Any]]:
+    """
+    For all games on date d, collect box score lines for DUKE_PLAYER_IDS.
+    Includes opponent (team tricode).
+    """
     game_ids = get_game_ids_for_date(d)
     if not game_ids:
         return []
@@ -154,7 +171,6 @@ def collect_duke_lines_for_date(d: date) -> List[Dict[str, Any]]:
             print(f"    ! boxscore error for {gid}: {repr(e)}")
             continue
 
-    # Sort by points desc, then name
     results.sort(key=lambda r: (-r["points"], r["player_name"]))
     return results
 
@@ -162,7 +178,7 @@ def collect_duke_lines_for_date(d: date) -> List[Dict[str, Any]]:
 # ---------------- EMAIL ----------------
 
 def build_email_body(lines: List[Dict[str, Any]], d: date) -> str:
-    header = f"Duke in the NBA — {d.strftime('%A, %B %d, %Y')}\n" + ("-" * 48)
+    header = f"Duke in the NBA — {d.strftime('%A, %B %d, %Y')}\n" + ("-" * 56)
     if not lines:
         return header + "\nNo Duke alumni recorded box score stats in NBA games on this date."
 
@@ -178,15 +194,25 @@ def build_email_body(lines: List[Dict[str, Any]], d: date) -> str:
 
 
 def send_email(subject: str, body: str) -> None:
+    """
+    Send email if SMTP config is present; otherwise print.
+    If SMTP login fails, print and return (so workflow doesn't crash silently).
+    """
     import smtplib
     from email.mime.text import MIMEText
 
     smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port_raw = os.getenv("SMTP_PORT", "587")
     smtp_user = os.getenv("SMTP_USER")
     smtp_password = os.getenv("SMTP_PASSWORD")
     email_from = os.getenv("EMAIL_FROM")
     email_to = os.getenv("EMAIL_TO")
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except ValueError:
+        print(f"Invalid SMTP_PORT={smtp_port_raw!r}; defaulting to 587")
+        smtp_port = 587
 
     if not email_to or not smtp_host or not email_from:
         print("\n--- EMAIL (not sent; missing EMAIL_TO/SMTP_HOST/EMAIL_FROM) ---")
@@ -200,28 +226,36 @@ def send_email(subject: str, body: str) -> None:
     msg["From"] = email_from
     msg["To"] = email_to
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        if smtp_user and smtp_password:
-            server.login(smtp_user, smtp_password)
-        server.sendmail(email_from, [email_to], msg.as_string())
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.sendmail(email_from, [email_to], msg.as_string())
+        print(f"Email sent to {email_to}.")
+    except Exception as e:
+        print(f"SMTP send failed: {repr(e)}")
+        print("\n--- EMAIL (printing instead) ---")
+        print("Subject:", subject)
+        print(body)
+        print("--- END ---\n")
 
-    print(f"Email sent to {email_to}.")
 
+# ---------------- MAIN ----------------
 
 def main() -> None:
     target_date = date.today() - timedelta(days=1)
+
     try:
         lines = collect_duke_lines_for_date(target_date)
         subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')}"
         body = build_email_body(lines, target_date)
         send_email(subject, body)
     except Exception as e:
-        # Fail gracefully: send a “data unavailable” email instead of crashing the workflow
         subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')} (Data unavailable)"
         body = (
             f"Duke in the NBA — {target_date.strftime('%A, %B %d, %Y')}\n"
-            + "-" * 48
+            + "-" * 56
             + "\nNBA data fetch failed during this run.\n"
             f"Error: {repr(e)}\n"
         )
