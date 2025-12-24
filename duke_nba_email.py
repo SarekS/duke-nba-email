@@ -2,28 +2,29 @@
 """
 Daily email of Duke NBA player stats (with opponent) for yesterday's games.
 
-Data sources (NBA JSON feeds):
-- Scoreboard (game list): https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_YYYYMMDD.json
-- Boxscore per game:      https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gameId}.json
+LOCAL mode using nba_api (stats.nba.com):
+- ScoreboardV2 for game list
+- BoxScoreTraditionalV2 for box scores
 
-Email via SMTP using env vars:
+Email via SMTP env vars:
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
 
-If EMAIL_TO or required SMTP settings are missing, prints the email instead of sending.
-If NBA data fetch fails, attempts to send a "Data unavailable" email; if SMTP fails, prints.
+If EMAIL_TO missing, prints instead of sending.
 """
 
 import os
 import time
 import random
+import traceback
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Any, Optional
 
+import pandas as pd
 import requests
+from nba_api.stats.endpoints import scoreboardv2, boxscoretraditionalv2
 
 
-# ---------------- HARDCODED DUKE PLAYER IDS (NBA.com personId) ----------------
-# NOTE: Some newer/rookie IDs below may need verification.
+# ---------------- HARDCODED DUKE PLAYER IDS (NBA.com PLAYER_ID) ----------------
 DUKE_PLAYER_IDS = {
     1627751,  # Grayson Allen
     1628976,  # Marvin Bagley III
@@ -32,21 +33,16 @@ DUKE_PLAYER_IDS = {
     1628970,  # Wendell Carter Jr.
     203552,   # Seth Curry
     1631132,  # Kyle Filipowski
-    1642843,  # Cooper Flagg (verify if needed)
     1627742,  # Brandon Ingram
     202681,   # Kyrie Irving
-    1642883,  # Sion James (verify if needed)
     1630552,  # Jalen Johnson
     1629014,  # Tre Jones
     1628969,  # Tyus Jones
     1628384,  # Luke Kennard
-    1642851,  # Kon Knueppel (verify if needed)
     1631108,  # Dereck Lively II
-    1642863,  # Khaman Maluach (verify if needed)
     1631135,  # Jared McCain
     1631111,  # Wendell Moore Jr.
     203486,   # Mason Plumlee
-    1642878,  # Tyrese Proctor (verify if needed)
     1628369,  # Jayson Tatum
     1627783,  # Gary Trent Jr.
     1630228,  # Mark Williams
@@ -55,149 +51,138 @@ DUKE_PLAYER_IDS = {
 }
 
 
-# ---------------- HTTP HELPERS ----------------
+# ---------------- RETRY HELPER ----------------
 
-def get_with_retries(url: str, *, timeout: int = 30, retries: int = 5) -> requests.Response:
-    """
-    GET with retries + browser-like headers to reduce 403s from NBA CDN.
-    """
+def with_retries(fn, *, retries: int = 5, base_sleep: float = 2.0, label: str = "request"):
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
-                url,
-                timeout=timeout,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "application/json,text/plain,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://www.nba.com/",
-                    "Origin": "https://www.nba.com",
-                    "Connection": "keep-alive",
-                },
-            )
-            r.raise_for_status()
-            return r
-        except Exception as e:
+            return fn()
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                TimeoutError) as e:
             last_err = e
-            sleep_s = (2 ** (attempt - 1)) + random.uniform(0, 0.7)
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.7)
+            print(f"  ! {label} failed (attempt {attempt}/{retries}): {repr(e)}")
             if attempt < retries:
-                print(f"  ! GET failed ({attempt}/{retries}) {url} -> {repr(e)}; retry in {sleep_s:.1f}s")
+                print(f"    retrying in {sleep_s:.1f}s...")
                 time.sleep(sleep_s)
-            else:
-                print(f"  ! GET failed ({attempt}/{retries}) {url} -> {repr(e)}; giving up")
-    raise last_err  # type: ignore
+    # If it's not one of the above exceptions, or we exhausted retries:
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"{label} failed for unknown reasons")
 
 
-# ---------------- NBA DATA ----------------
+# ---------------- NBA FETCHING ----------------
 
-def get_game_ids_for_date(d: date) -> List[str]:
-    """
-    Fetch game IDs for a given date using NBA's liveData scoreboard JSON.
-    """
-    ymd = d.strftime("%Y%m%d")
-    url = f"https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_{ymd}.json"
-    print(f"Fetching scoreboard: {url}")
-    data = get_with_retries(url).json()
-    games = data.get("scoreboard", {}).get("games", [])
-    return [g.get("gameId") for g in games if g.get("gameId")]
+def get_scoreboard_for_date(target_date: date) -> pd.DataFrame:
+    date_str = target_date.strftime("%m/%d/%Y")
+    print(f"Fetching NBA scoreboard for {date_str}...")
 
+    def _call():
+        sb = scoreboardv2.ScoreboardV2(game_date=date_str, timeout=90)
+        return sb.game_header.get_data_frame()
 
-def get_boxscore_json(game_id: str) -> Dict[str, Any]:
-    """
-    Fetch full boxscore JSON for a game.
-    """
-    url = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
-    return get_with_retries(url).json()
+    return with_retries(_call, retries=5, base_sleep=2, label="scoreboardv2")
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def get_duke_stats_for_date(target_date: date, duke_ids: List[int]) -> pd.DataFrame:
+    games_df = get_scoreboard_for_date(target_date)
+    if games_df.empty:
+        return pd.DataFrame()
 
+    rows: List[Dict[str, Any]] = []
+    date_str = target_date.strftime("%Y-%m-%d")
 
-def collect_duke_lines_for_date(d: date) -> List[Dict[str, Any]]:
-    """
-    For all games on date d, collect box score lines for DUKE_PLAYER_IDS.
-    Includes opponent (team tricode).
-    """
-    game_ids = get_game_ids_for_date(d)
-    if not game_ids:
-        return []
+    for _, game in games_df.iterrows():
+        game_id = game["GAME_ID"]
+        home_team_id = int(game["HOME_TEAM_ID"])
+        visitor_team_id = int(game["VISITOR_TEAM_ID"])
 
-    results: List[Dict[str, Any]] = []
-    for gid in game_ids:
-        print(f"  Processing game {gid}...")
+        print(f"  Processing game {game_id}...")
+
+        def _box():
+            bs = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id, timeout=90)
+            return bs.player_stats.get_data_frame()
+
         try:
-            bs = get_boxscore_json(gid)
-            game = bs.get("game", {})
-            home = game.get("homeTeam", {})
-            away = game.get("awayTeam", {})
-            home_abbr = home.get("teamTricode", "HOME")
-            away_abbr = away.get("teamTricode", "AWAY")
-
-            for team_obj, opp_abbr in ((home, away_abbr), (away, home_abbr)):
-                team_abbr = team_obj.get("teamTricode", "UNK")
-                for p in team_obj.get("players", []):
-                    pid = _safe_int(p.get("personId"))
-                    if pid not in DUKE_PLAYER_IDS:
-                        continue
-
-                    stats = p.get("statistics", {}) or {}
-                    results.append({
-                        "player_id": pid,
-                        "player_name": p.get("name", "Unknown"),
-                        "team": team_abbr,
-                        "opponent": opp_abbr,
-                        "minutes": stats.get("minutes", ""),
-                        "points": _safe_int(stats.get("points")),
-                        "rebounds": _safe_int(stats.get("reboundsTotal")),
-                        "assists": _safe_int(stats.get("assists")),
-                        "fgm": _safe_int(stats.get("fieldGoalsMade")),
-                        "fga": _safe_int(stats.get("fieldGoalsAttempted")),
-                        "fg3m": _safe_int(stats.get("threePointersMade")),
-                        "fg3a": _safe_int(stats.get("threePointersAttempted")),
-                        "ftm": _safe_int(stats.get("freeThrowsMade")),
-                        "fta": _safe_int(stats.get("freeThrowsAttempted")),
-                        "plus_minus": _safe_int(stats.get("plusMinusPoints")),
-                    })
+            players_df = with_retries(_box, retries=4, base_sleep=2, label=f"boxscore {game_id}")
         except Exception as e:
-            print(f"    ! boxscore error for {gid}: {repr(e)}")
+            print(f"    ! Error fetching box score for {game_id}: {repr(e)}")
             continue
 
-    results.sort(key=lambda r: (-r["points"], r["player_name"]))
-    return results
+        if players_df.empty:
+            continue
+
+        for _, p in players_df.iterrows():
+            pid = int(p["PLAYER_ID"])
+            if pid not in duke_ids:
+                continue
+
+            team_id = int(p["TEAM_ID"])
+            team_abbr = p["TEAM_ABBREVIATION"]
+
+            opp_team_id = visitor_team_id if team_id == home_team_id else home_team_id
+            opp_abbrs = (
+                players_df.loc[players_df["TEAM_ID"] == opp_team_id, "TEAM_ABBREVIATION"]
+                .dropna()
+                .unique()
+            )
+            opp_abbr = opp_abbrs[0] if len(opp_abbrs) else "UNK"
+
+            rows.append({
+                "date": date_str,
+                "game_id": game_id,
+                "player_id": pid,
+                "player_name": f"{p['PLAYER_FIRST_NAME']} {p['PLAYER_LAST_NAME']}",
+                "team": team_abbr,
+                "opponent": opp_abbr,
+                "minutes": p["MIN"],
+                "points": int(p["PTS"]),
+                "rebounds": int(p["REB"]),
+                "assists": int(p["AST"]),
+                "fgm": int(p["FGM"]),
+                "fga": int(p["FGA"]),
+                "fg3m": int(p["FG3M"]),
+                "fg3a": int(p["FG3A"]),
+                "ftm": int(p["FTM"]),
+                "fta": int(p["FTA"]),
+                "plus_minus": p["PLUS_MINUS"],
+            })
+
+        # gentle pacing to avoid rate limits
+        time.sleep(random.uniform(0.4, 1.0))
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values(["player_name"])
+    return df
 
 
 # ---------------- EMAIL ----------------
 
-def build_email_body(lines: List[Dict[str, Any]], d: date) -> str:
-    header = f"Duke in the NBA — {d.strftime('%A, %B %d, %Y')}\n" + ("-" * 56)
-    if not lines:
-        return header + "\nNo Duke alumni recorded box score stats in NBA games on this date."
+def format_email_body(stats_df: pd.DataFrame, target_date: date) -> str:
+    header_date = target_date.strftime("%A, %B %d, %Y")
+    lines = [f"Duke in the NBA — {header_date}", "-" * 56]
 
-    out = [header, ""]
-    for r in lines:
-        out.append(
-            f"{r['player_name']} ({r['team']} vs {r['opponent']}): "
-            f"{r['points']} PTS, {r['rebounds']} REB, {r['assists']} AST, "
-            f"{r['minutes']} MIN, +/- {r['plus_minus']} "
-            f"(FG {r['fgm']}-{r['fga']}, 3P {r['fg3m']}-{r['fg3a']}, FT {r['ftm']}-{r['fta']})"
+    if stats_df.empty:
+        lines.append("No Duke alumni recorded box score stats in NBA games on this date.")
+        return "\n".join(lines)
+
+    for _, row in stats_df.iterrows():
+        lines.append(
+            f"{row['player_name']} ({row['team']} vs {row['opponent']}): "
+            f"{row['points']} PTS, {row['rebounds']} REB, {row['assists']} AST, {row['minutes']} MIN, "
+            f"+/- {row['plus_minus']} "
+            f"(FG {row['fgm']}-{row['fga']}, 3P {row['fg3m']}-{row['fg3a']}, FT {row['ftm']}-{row['fta']})"
         )
-    return "\n".join(out)
+
+    return "\n".join(lines)
 
 
 def send_email(subject: str, body: str) -> None:
-    """
-    Send email if SMTP config is present; otherwise print.
-    If SMTP login fails, print and return (so workflow doesn't crash silently).
-    """
     import smtplib
     from email.mime.text import MIMEText
 
@@ -211,7 +196,6 @@ def send_email(subject: str, body: str) -> None:
     try:
         smtp_port = int(smtp_port_raw)
     except ValueError:
-        print(f"Invalid SMTP_PORT={smtp_port_raw!r}; defaulting to 587")
         smtp_port = 587
 
     if not email_to or not smtp_host or not email_from:
@@ -235,31 +219,21 @@ def send_email(subject: str, body: str) -> None:
         print(f"Email sent to {email_to}.")
     except Exception as e:
         print(f"SMTP send failed: {repr(e)}")
+        traceback.print_exc()
         print("\n--- EMAIL (printing instead) ---")
         print("Subject:", subject)
         print(body)
         print("--- END ---\n")
 
 
-# ---------------- MAIN ----------------
-
 def main() -> None:
     target_date = date.today() - timedelta(days=1)
+    duke_ids = list(DUKE_PLAYER_IDS)
 
-    try:
-        lines = collect_duke_lines_for_date(target_date)
-        subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')}"
-        body = build_email_body(lines, target_date)
-        send_email(subject, body)
-    except Exception as e:
-        subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')} (Data unavailable)"
-        body = (
-            f"Duke in the NBA — {target_date.strftime('%A, %B %d, %Y')}\n"
-            + "-" * 56
-            + "\nNBA data fetch failed during this run.\n"
-            f"Error: {repr(e)}\n"
-        )
-        send_email(subject, body)
+    stats_df = get_duke_stats_for_date(target_date, duke_ids)
+    subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')}"
+    body = format_email_body(stats_df, target_date)
+    send_email(subject, body)
 
 
 if __name__ == "__main__":
