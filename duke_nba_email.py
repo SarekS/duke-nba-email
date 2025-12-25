@@ -2,13 +2,20 @@
 """
 Duke NBA Daily Email (LOCAL, nba_api) — 2025–26 compatible
 
-- ScoreboardV2 for games
-- BoxScoreTraditionalV3 for box scores (V2 is deprecated/no data in 2025–26)
+Uses:
+- ScoreboardV2 for games (stats.nba.com)
+- BoxScoreTraditionalV3 for box scores (V2 no longer publishes data in 2025–26)
 - Filters Duke alumni by checking CommonPlayerInfo SCHOOL (cached locally)
-- Outputs:
-    1) prints a markdown table (goes to log when scheduled)
-    2) writes CSV + HTML table files for easy viewing
-    3) sends email (or prints if SMTP env vars missing)
+
+Outputs each run:
+1) Prints a markdown table (goes to console if manual; goes to log if scheduled with redirection)
+2) Writes CSV + HTML files you can open:
+     duke_boxscore_YYYY-MM-DD.csv
+     duke_boxscore_YYYY-MM-DD.html
+3) Sends email (plain text + HTML table) if SMTP env vars set; otherwise prints
+
+Install:
+  py -m pip install nba_api pandas requests
 """
 
 import os
@@ -16,7 +23,7 @@ import json
 import time
 import random
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -63,6 +70,23 @@ def with_retries(
 
 def polite_sleep() -> None:
     time.sleep(random.uniform(0.25, 0.75))
+
+
+# ---------------- SCHEMA HELPERS (V3 varies) ----------------
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Return the first column name that exists in df from a list of candidates.
+    Tries exact match first, then case-insensitive match.
+    """
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    lower_map = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
 
 
 # ---------------- SCHOOL CACHE ----------------
@@ -117,20 +141,6 @@ def get_games(target_date: date) -> pd.DataFrame:
 
     return with_retries(_call, retries=5, base_sleep=2, label="scoreboardv2")
 
-def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """
-    Return the first column name that exists in df from a list of candidates.
-    Tries exact match first, then case-insensitive match.
-    """
-    cols = list(df.columns)
-    for c in candidates:
-        if c in cols:
-            return c
-    lower_map = {c.lower(): c for c in cols}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    return None
 
 def get_duke_boxscores(target_date: date) -> pd.DataFrame:
     games_df = get_games(target_date)
@@ -161,17 +171,47 @@ def get_duke_boxscores(target_date: date) -> pd.DataFrame:
         if players_df.empty:
             continue
 
-        # map TEAM_ID -> TEAM_ABBREVIATION in this game
+        # --- (2) Robust team columns ---
+        team_id_col = pick_col(players_df, ["TEAM_ID", "teamId", "TEAMID"])
+        team_abbr_col = pick_col(players_df, ["TEAM_ABBREVIATION", "teamTricode", "TEAM_TRICODE", "TEAM_ABBR"])
+
+        if not team_id_col or not team_abbr_col:
+            print("    ! Unexpected V3 player_stats schema. Columns are:")
+            print("    ", list(players_df.columns))
+            continue
+
         team_abbr_map = (
-            players_df[["TEAM_ID", "TEAM_ABBREVIATION"]]
+            players_df[[team_id_col, team_abbr_col]]
             .dropna()
             .drop_duplicates()
-            .set_index("TEAM_ID")["TEAM_ABBREVIATION"]
+            .set_index(team_id_col)[team_abbr_col]
             .to_dict()
         )
 
+        # Other common columns may also vary; we’ll pick robustly where helpful
+        pid_col = pick_col(players_df, ["PLAYER_ID", "personId", "PERSON_ID"])
+        first_col = pick_col(players_df, ["PLAYER_FIRST_NAME", "firstName", "FIRST_NAME"])
+        last_col = pick_col(players_df, ["PLAYER_LAST_NAME", "familyName", "LAST_NAME"])
+        min_col = pick_col(players_df, ["MIN", "minutes", "MINUTES"])
+        pts_col = pick_col(players_df, ["PTS", "points"])
+        reb_col = pick_col(players_df, ["REB", "reboundsTotal", "reb"])
+        ast_col = pick_col(players_df, ["AST", "assists", "ast"])
+        fgm_col = pick_col(players_df, ["FGM", "fieldGoalsMade"])
+        fga_col = pick_col(players_df, ["FGA", "fieldGoalsAttempted"])
+        fg3m_col = pick_col(players_df, ["FG3M", "threePointersMade"])
+        fg3a_col = pick_col(players_df, ["FG3A", "threePointersAttempted"])
+        ftm_col = pick_col(players_df, ["FTM", "freeThrowsMade"])
+        fta_col = pick_col(players_df, ["FTA", "freeThrowsAttempted"])
+        pm_col = pick_col(players_df, ["PLUS_MINUS", "plusMinusPoints", "PLUSMINUS"])
+
+        if not pid_col:
+            print("    ! Missing PLAYER_ID-like column. Columns are:")
+            print("    ", list(players_df.columns))
+            continue
+
         for _, p in players_df.iterrows():
-            pid = int(p["PLAYER_ID"])
+            pid = int(p[pid_col])
+
             try:
                 if not is_duke_player(pid, cache):
                     continue
@@ -179,24 +219,50 @@ def get_duke_boxscores(target_date: date) -> pd.DataFrame:
                 print(f"    ! playerinfo failed for PLAYER_ID={pid}: {repr(e)}")
                 continue
 
-            team_id = int(p["TEAM_ID"])
-            team_abbr = str(p["TEAM_ABBREVIATION"])
+            # --- (3) Use robust team columns for team/opponent ---
+            team_id = int(p[team_id_col])
+            team_abbr = str(p[team_abbr_col])
 
             opp_team_id = away_team_id if team_id == home_team_id else home_team_id
             opp_abbr = team_abbr_map.get(opp_team_id, "UNK")
 
+            first = str(p[first_col]) if first_col else ""
+            last = str(p[last_col]) if last_col else ""
+            name = (first + " " + last).strip() or f"PLAYER_{pid}"
+
+            def as_int(col: Optional[str]) -> int:
+                if not col:
+                    return 0
+                try:
+                    return int(p[col])
+                except Exception:
+                    return 0
+
+            def as_str(col: Optional[str]) -> str:
+                if not col:
+                    return ""
+                v = p[col]
+                return "" if v is None else str(v)
+
+            fgm = as_int(fgm_col)
+            fga = as_int(fga_col)
+            fg3m = as_int(fg3m_col)
+            fg3a = as_int(fg3a_col)
+            ftm = as_int(ftm_col)
+            fta = as_int(fta_col)
+
             rows.append({
-                "Player": f"{p['PLAYER_FIRST_NAME']} {p['PLAYER_LAST_NAME']}",
+                "Player": name,
                 "Team": team_abbr,
                 "Opponent": opp_abbr,
-                "MIN": p.get("MIN", ""),
-                "PTS": int(p.get("PTS", 0)),
-                "REB": int(p.get("REB", 0)),
-                "AST": int(p.get("AST", 0)),
-                "FG": f"{int(p.get('FGM', 0))}-{int(p.get('FGA', 0))}",
-                "3P": f"{int(p.get('FG3M', 0))}-{int(p.get('FG3A', 0))}",
-                "FT": f"{int(p.get('FTM', 0))}-{int(p.get('FTA', 0))}",
-                "+/-": p.get("PLUS_MINUS", ""),
+                "MIN": as_str(min_col),
+                "PTS": as_int(pts_col),
+                "REB": as_int(reb_col),
+                "AST": as_int(ast_col),
+                "FG": f"{fgm}-{fga}",
+                "3P": f"{fg3m}-{fg3a}",
+                "FT": f"{ftm}-{fta}",
+                "+/-": as_str(pm_col),
             })
 
         polite_sleep()
@@ -215,7 +281,6 @@ def write_table_files(stats_df: pd.DataFrame, target_date: date) -> Dict[str, Pa
     html_path = BASE_DIR / f"duke_boxscore_{ymd}.html"
 
     if stats_df.empty:
-        # still write empty markers so you know it ran
         csv_path.write_text("No rows\n", encoding="utf-8")
         html_path.write_text("<p>No rows</p>", encoding="utf-8")
     else:
@@ -278,7 +343,6 @@ def send_email(subject: str, body: str, html_table: Optional[str] = None) -> Non
     msg["To"] = email_to
 
     msg.attach(MIMEText(body, "plain"))
-
     if html_table:
         html = f"<pre>{body}</pre><hr/>{html_table}"
         msg.attach(MIMEText(html, "html"))
@@ -298,11 +362,10 @@ def send_email(subject: str, body: str, html_table: Optional[str] = None) -> Non
 def main() -> None:
     target_date = date.today() - timedelta(days=1)
 
-    # Fetch games once so we can report the count in email even if boxscores empty
     games_df = get_games(target_date)
     stats_df = get_duke_boxscores(target_date)
 
-    # Always print a table to stdout (goes to log when scheduled)
+    # Print table (visible when manual; captured to log when scheduled)
     print("\n--- DUKE BOX SCORE TABLE ---")
     if stats_df.empty:
         print("(empty)")
@@ -310,15 +373,15 @@ def main() -> None:
         print(stats_df.to_markdown(index=False))
     print("--- END TABLE ---\n")
 
-    # Always write files so you can open them
+    # Write files you can open regardless of scheduler
     paths = write_table_files(stats_df, target_date)
     print(f"Wrote CSV:  {paths['csv']}")
     print(f"Wrote HTML: {paths['html']}")
 
-    body = format_email_body(stats_df, target_date, games_found=len(games_df))
     subject = f"Duke in the NBA — {target_date.strftime('%Y-%m-%d')}"
-
+    body = format_email_body(stats_df, target_date, games_found=len(games_df))
     html_table = None if stats_df.empty else stats_df.to_html(index=False)
+
     send_email(subject, body, html_table=html_table)
 
 
