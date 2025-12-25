@@ -117,6 +117,20 @@ def get_games(target_date: date) -> pd.DataFrame:
 
     return with_retries(_call, retries=5, base_sleep=2, label="scoreboardv2")
 
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Return the first column name that exists in df from a list of candidates.
+    Tries exact match first, then case-insensitive match.
+    """
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    lower_map = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
 
 def get_duke_boxscores(target_date: date) -> pd.DataFrame:
     games_df = get_games(target_date)
