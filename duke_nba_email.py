@@ -200,7 +200,7 @@ def get_duke_boxscores(target_date: date) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     # Nice column order (requested)
-    desired = ["Player", "Team", "Opponent", "MIN", "PTS", "OREB", "DREB", "REB", "AST", "STL", "BLK", "TOV", "FG", "3P", "FT", "+/-"]
+    desired = ["Player", "Team", "Opponent", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG", "3P", "FT","MIN", "+/-"]
     df = df[[c for c in desired if c in df.columns]]
 
     if "PTS" in df.columns:
